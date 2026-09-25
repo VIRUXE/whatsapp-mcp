@@ -1159,7 +1159,63 @@ func extractTextContent(msg *waProto.Message) string {
 		}
 	}
 
+	// Shared locations and contact cards carry no text of their own; render
+	// them as text so they are stored, searchable and forwarded instead of
+	// being dropped at the "no content and no media" gate.
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return locationText("Location", loc.GetDegreesLatitude(), loc.GetDegreesLongitude(), loc.GetName(), loc.GetAddress(), loc.GetComment())
+	}
+	if live := msg.GetLiveLocationMessage(); live != nil {
+		return locationText("Live location", live.GetDegreesLatitude(), live.GetDegreesLongitude(), "", "", live.GetCaption())
+	}
+	if c := msg.GetContactMessage(); c != nil {
+		return contactText(c.GetDisplayName(), c.GetVcard())
+	}
+	if arr := msg.GetContactsArrayMessage(); arr != nil {
+		var parts []string
+		for _, c := range arr.GetContacts() {
+			parts = append(parts, contactText(c.GetDisplayName(), c.GetVcard()))
+		}
+		return strings.Join(parts, "\n")
+	}
+
 	return ""
+}
+
+// locationText renders a shared location as one line with a maps link.
+func locationText(kind string, lat, lng float64, name, address, comment string) string {
+	var details []string
+	for _, v := range []string{name, address, comment} {
+		if v = strings.TrimSpace(v); v != "" {
+			details = append(details, v)
+		}
+	}
+	text := fmt.Sprintf("[%s] %.6f, %.6f https://maps.google.com/?q=%.6f,%.6f", kind, lat, lng, lat, lng)
+	if len(details) > 0 {
+		text += " (" + strings.Join(details, ", ") + ")"
+	}
+	return text
+}
+
+// contactText renders a shared contact card: its name and phone numbers.
+func contactText(name, vcard string) string {
+	var phones []string
+	for _, line := range strings.Split(vcard, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), "TEL") {
+			continue
+		}
+		if i := strings.LastIndex(line, ":"); i >= 0 {
+			if p := strings.TrimSpace(line[i+1:]); p != "" {
+				phones = append(phones, p)
+			}
+		}
+	}
+	text := "[Contact] " + strings.TrimSpace(name)
+	if len(phones) > 0 {
+		text += " " + strings.Join(phones, ", ")
+	}
+	return strings.TrimSpace(text)
 }
 
 // SendMessageResponse represents the response for the send message API
