@@ -2659,6 +2659,93 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		}
 	}))
 
+	// Group participants: GET ?group_jid=... lists them, POST
+	// {"group_jid": "...@g.us", "add": ["351...", "...@s.whatsapp.net"]} adds them.
+	mux.HandleFunc("/api/group/participants", auth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		writeErr := func(code int, msg string) {
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "message": msg})
+		}
+		toJID := func(s string) (types.JID, error) {
+			if strings.Contains(s, "@") {
+				return types.ParseJID(s)
+			}
+			return types.JID{User: s, Server: types.DefaultUserServer}, nil
+		}
+		describe := func(ps []types.GroupParticipant) []map[string]interface{} {
+			out := make([]map[string]interface{}, 0, len(ps))
+			for _, p := range ps {
+				out = append(out, map[string]interface{}{
+					"jid":          p.JID.String(),
+					"phone_number": p.PhoneNumber.String(),
+					"lid":          p.LID.String(),
+					"is_admin":     p.IsAdmin,
+					"error":        p.Error,
+				})
+			}
+			return out
+		}
+
+		switch r.Method {
+		case http.MethodGet:
+			groupJID, err := types.ParseJID(r.URL.Query().Get("group_jid"))
+			if err != nil || groupJID.Server != types.GroupServer {
+				writeErr(http.StatusBadRequest, "group_jid must be a ...@g.us JID")
+				return
+			}
+			info, err := client.GetGroupInfo(r.Context(), groupJID)
+			if err != nil {
+				writeErr(http.StatusBadGateway, fmt.Sprintf("GetGroupInfo failed: %v", err))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":      true,
+				"name":         info.Name,
+				"participants": describe(info.Participants),
+			})
+		case http.MethodPost:
+			var req struct {
+				GroupJID string   `json:"group_jid"`
+				Add      []string `json:"add"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeErr(http.StatusBadRequest, "Invalid request format")
+				return
+			}
+			groupJID, err := types.ParseJID(req.GroupJID)
+			if err != nil || groupJID.Server != types.GroupServer {
+				writeErr(http.StatusBadRequest, "group_jid must be a ...@g.us JID")
+				return
+			}
+			if len(req.Add) == 0 {
+				writeErr(http.StatusBadRequest, "add must list at least one participant")
+				return
+			}
+			jids := make([]types.JID, 0, len(req.Add))
+			for _, s := range req.Add {
+				j, err := toJID(s)
+				if err != nil {
+					writeErr(http.StatusBadRequest, fmt.Sprintf("Error parsing JID %q: %v", s, err))
+					return
+				}
+				jids = append(jids, j)
+			}
+			fmt.Printf("→ /api/group/participants add group=%s participants=%v\n", groupJID, jids)
+			res, err := client.UpdateGroupParticipants(r.Context(), groupJID, jids, whatsmeow.ParticipantChangeAdd)
+			if err != nil {
+				writeErr(http.StatusBadGateway, fmt.Sprintf("UpdateGroupParticipants failed: %v", err))
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":      true,
+				"participants": describe(res),
+			})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
+
 	return mux
 }
 
