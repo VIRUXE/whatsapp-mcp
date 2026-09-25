@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -3269,5 +3270,54 @@ func TestRenderPairingQRCodes_Outcomes(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: outcome = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestRenderPairingCode requests the pairing code exactly once, on the first
+// QR event, and keeps waiting through later QR rotations until success.
+func TestRenderPairingCode(t *testing.T) {
+	qrChan := make(chan whatsmeow.QRChannelItem, 3)
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "first-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "rotated-code"}
+	qrChan <- whatsmeow.QRChannelItem{Event: "success"}
+	close(qrChan)
+
+	calls := 0
+	var out strings.Builder
+	outcome := renderPairingCode(qrChan, &out, func() (string, error) {
+		calls++
+		return "ABCD-EFGH", nil
+	})
+	if outcome != pairingQRSucceeded {
+		t.Errorf("outcome = %v, want pairingQRSucceeded", outcome)
+	}
+	if calls != 1 {
+		t.Errorf("requested the pairing code %d times, want 1", calls)
+	}
+	if !strings.Contains(out.String(), "ABCD-EFGH") {
+		t.Errorf("pairing code missing from output:\n%s", out.String())
+	}
+}
+
+func TestRenderPairingCode_RequestError(t *testing.T) {
+	qrChan := make(chan whatsmeow.QRChannelItem, 1)
+	qrChan <- whatsmeow.QRChannelItem{Event: "code", Code: "c"}
+	close(qrChan)
+	got := renderPairingCode(qrChan, io.Discard, func() (string, error) {
+		return "", errors.New("rate limited")
+	})
+	if got != pairingQRTimedOut {
+		t.Errorf("outcome = %v, want pairingQRTimedOut", got)
+	}
+}
+
+func TestResolvePairPhone(t *testing.T) {
+	t.Setenv("WHATSAPP_PAIR_PHONE", "+351 918-593 067")
+	if got := resolvePairPhone(); got != "351918593067" {
+		t.Errorf("resolvePairPhone() = %q, want 351918593067", got)
+	}
+	t.Setenv("WHATSAPP_PAIR_PHONE", "")
+	if got := resolvePairPhone(); got != "" {
+		t.Errorf("resolvePairPhone() = %q, want empty", got)
 	}
 }

@@ -82,6 +82,21 @@ func resolveDeviceName() string {
 	return strings.TrimSpace(os.Getenv("WHATSAPP_DEVICE_NAME"))
 }
 
+// resolvePairPhone returns the phone number from WHATSAPP_PAIR_PHONE with every
+// non-digit stripped ("+351 918 593 067" -> "351918593067"). When set, a fresh
+// pair prints an 8-character pairing code (entered on the phone under Linked
+// devices > Link with phone number instead) instead of a QR code, for servers
+// where nobody can see the terminal.
+func resolvePairPhone() string {
+	var b strings.Builder
+	for _, r := range os.Getenv("WHATSAPP_PAIR_PHONE") {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 // Message represents a chat message for our client
 type Message struct {
 	Time      time.Time
@@ -2952,6 +2967,35 @@ func renderPairingQRCodes(qrChan <-chan whatsmeow.QRChannelItem, w io.Writer, re
 	return pairingQRChannelClosed
 }
 
+// renderPairingCode is the WHATSAPP_PAIR_PHONE counterpart of
+// renderPairingQRCodes. whatsmeow only accepts PairPhone once the QR channel
+// has emitted its first code, so the code is requested there; later QR
+// refreshes are ignored because the pairing code stays valid across them.
+func renderPairingCode(qrChan <-chan whatsmeow.QRChannelItem, w io.Writer, requestCode func() (string, error)) pairingQROutcome {
+	requested := false
+	for evt := range qrChan {
+		switch evt.Event {
+		case "code":
+			if requested {
+				continue
+			}
+			requested = true
+			code, err := requestCode()
+			if err != nil {
+				_, _ = fmt.Fprintf(w, "\nFailed to request pairing code: %v\n", err)
+				return pairingQRTimedOut
+			}
+			_, _ = fmt.Fprintf(w, "\nPairing code: %s\nOn the phone: Linked devices > Link a device > Link with phone number instead.\n", code)
+			_, _ = fmt.Fprintln(w, "\nWaiting for the code to be entered...")
+		case "success":
+			return pairingQRSucceeded
+		case "timeout":
+			return pairingQRTimedOut
+		}
+	}
+	return pairingQRChannelClosed
+}
+
 func main() {
 	flag.Parse()
 
@@ -3272,10 +3316,19 @@ func main() {
 				continue
 			}
 
-			// Print QR codes for pairing with the phone.
-			switch renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
-				qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
-			}) {
+			// Pair with a phone-number code when WHATSAPP_PAIR_PHONE is set,
+			// otherwise print QR codes.
+			var outcome pairingQROutcome
+			if phone := resolvePairPhone(); phone != "" {
+				outcome = renderPairingCode(qrChan, os.Stdout, func() (string, error) {
+					return client.PairPhone(ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+				})
+			} else {
+				outcome = renderPairingQRCodes(qrChan, os.Stdout, func(code string, w io.Writer) {
+					qrterminal.GenerateHalfBlock(code, qrterminal.L, w)
+				})
+			}
+			switch outcome {
 			case pairingQRSucceeded:
 				connected <- true
 			case pairingQRTimedOut:
