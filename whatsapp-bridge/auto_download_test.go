@@ -64,7 +64,7 @@ func TestHandleMessage_AutomaticMediaControls(t *testing.T) {
 		{"disabled document and webhook", "false", "document", false, false, 0, 0},
 		{"default image", "", "image", true, false, 1, 0},
 		{"enabled image", "true", "image", true, false, 1, 0},
-		{"default document", "", "document", true, false, 1, 1},
+		{"default document", "", "document", true, false, 1, 0},
 		{"default image without webhook", "", "image", false, false, 1, 1},
 		{"default document without webhook", "", "document", false, false, 1, 1},
 		{"default failed image retry", "", "image", true, true, 2, 1},
@@ -118,6 +118,14 @@ func TestHandleMessage_AutomaticMediaControls(t *testing.T) {
 				}
 				if payload.MediaBase64 != wantBase64 {
 					t.Error("webhook image bytes did not match download policy")
+				}
+				if tc.kind == "document" {
+					if payload.MediaType != "document" || payload.MediaFilename != "example.pdf" {
+						t.Error("document webhook lost attachment metadata")
+					}
+					if tc.wantCalls > 0 && payload.MediaPath != path {
+						t.Errorf("document media path = %q, want %q", payload.MediaPath, path)
+					}
 				}
 			default:
 				if tc.webhook {

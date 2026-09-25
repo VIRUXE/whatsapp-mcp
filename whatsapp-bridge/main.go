@@ -1166,6 +1166,9 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// ID is the WhatsApp message ID of a successful send, so callers can
+	// thread, quote or deduplicate without querying the message store.
+	ID string `json:"id,omitempty"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -1451,9 +1454,9 @@ func resolveMentionJIDs(client *whatsmeow.Client, mentions []string) []string {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string, mentions []string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "", "Not connected to WhatsApp"
 	}
 
 	mentionedJIDs := resolveMentionJIDs(client, mentions)
@@ -1464,7 +1467,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	if strings.Contains(recipient, "@") {
 		settingsLookupJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, "", fmt.Sprintf("Error parsing JID: %v", err)
 		}
 	} else {
 		settingsLookupJID = types.JID{
@@ -1481,7 +1484,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 	recipientJID, err := resolveRecipientJID(client, recipient)
 	if err != nil {
-		return false, err.Error()
+		return false, "", err.Error()
 	}
 
 	msg := &waProto.Message{}
@@ -1495,7 +1498,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, "", fmt.Sprintf("Error reading media file: %v", err)
 		}
 
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
@@ -1503,7 +1506,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		// Upload media to WhatsApp servers
 		upload, err = client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, "", fmt.Sprintf("Error uploading media: %v", err)
 		}
 
 		// Don't log the struct itself — UploadResponse carries the MediaKey
@@ -1546,7 +1549,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, "", fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -1596,7 +1599,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			// Unreachable today (classifyMediaPath only returns the four
 			// types above), but fail loudly rather than send an empty proto
 			// while still persisting media metadata for it.
-			return false, fmt.Sprintf("Unsupported media type for %s", mediaPath)
+			return false, "", fmt.Sprintf("Unsupported media type for %s", mediaPath)
 		}
 	} else if quotedMsgID != "" || len(mentionedJIDs) > 0 {
 		// Quoted reply and/or mentions: use ExtendedTextMessage so we can
@@ -1637,7 +1640,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	// recipient would silently miss the disappearing-message settings row.
 	settings, err := messageStore.GetChatEphemeralSettings(resolveUserJID(client, settingsLookupJID, types.EmptyJID).String())
 	if err != nil && err != sql.ErrNoRows {
-		return false, fmt.Sprintf("Error loading chat settings: %v", err)
+		return false, "", fmt.Sprintf("Error loading chat settings: %v", err)
 	}
 	if err == nil {
 		applyChatEphemeralSettings(msg, settings)
@@ -1647,7 +1650,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, "", fmt.Sprintf("Error sending message: %v", err)
 	}
 
 	// whatsmeow does not re-emit events.Message for messages this client
@@ -1683,7 +1686,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), resp.ID
 }
 
 // Extract quoted message info from ContextInfo
@@ -1753,6 +1756,23 @@ func extractMentionedJIDs(msg *waProto.Message) []string {
 	}
 
 	return append([]string(nil), contextInfo.MentionedJID...)
+}
+
+// mediaMimetype returns the sender-declared MIME type of a message's media.
+func mediaMimetype(msg *waProto.Message) string {
+	switch {
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetMimetype()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetMimetype()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetMimetype()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetMimetype()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetMimetype()
+	}
+	return ""
 }
 
 // Extract media info from a message. Filenames embed the message ID so that
@@ -2091,37 +2111,39 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// The opt-out covers every implicit download, including webhook images.
 	shouldDownload := !isStatus && autoDownloadMediaEnabled()
 
-	// Forwarded images download synchronously to include bytes in the webhook.
-	// Other media downloads asynchronously for caching when downloads are enabled.
-	var imageDownloadPath string
-	imageMimeType := msg.Message.GetImageMessage().GetMimetype()
-	if mediaType == "image" && url != "" && len(mediaKey) > 0 && shouldForward && stored && shouldDownload {
-		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
+	// Forwarded media downloads synchronously so the webhook can carry the
+	// file (path for every type, base64 for images). Media that is not
+	// forwarded downloads asynchronously for caching.
+	var mediaDownloadPath string
+	mediaMimeType := mediaMimetype(msg.Message)
+	if mediaType != "" && url != "" && len(mediaKey) > 0 && shouldForward && stored && shouldDownload {
+		logger.Infof("Downloading %s media for message %s (synchronous)", mediaType, msg.Info.ID)
 		success, _, _, dlPath, dlErr := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 		if success && dlErr == nil {
-			imageDownloadPath = dlPath
-			// Detect MIME type by sniffing the actual file bytes rather than
-			// trusting the generated filename extension (always .jpg).
-			if f, openErr := os.Open(dlPath); openErr == nil {
-				buf := make([]byte, 512)
-				if n, readErr := f.Read(buf); readErr == nil || n > 0 {
-					imageMimeType = http.DetectContentType(buf[:n])
+			mediaDownloadPath = dlPath
+			// Images: sniff the actual bytes rather than trusting the
+			// generated filename extension (always .jpg).
+			if mediaType == "image" {
+				if f, openErr := os.Open(dlPath); openErr == nil {
+					buf := make([]byte, 512)
+					if n, readErr := f.Read(buf); readErr == nil || n > 0 {
+						mediaMimeType = http.DetectContentType(buf[:n])
+					}
+					_ = f.Close()
 				}
-				_ = f.Close()
 			}
-			if imageMimeType == "" {
-				imageMimeType = "application/octet-stream"
+			if mediaMimeType == "" {
+				mediaMimeType = "application/octet-stream"
 			}
-			logger.Infof("✅ Image downloaded: %s (%s)", dlPath, imageMimeType)
+			logger.Infof("✅ Media downloaded: %s (%s)", dlPath, mediaMimeType)
 		} else {
-			logger.Warnf("❌ Image download failed: %v", dlErr)
+			logger.Warnf("❌ Media download failed: %v", dlErr)
 			// Fall back to async download so media is cached for future MCP tool calls
 			scheduleMediaDownload(func() {
 				_, _, _, _, _ = downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
 			})
 		}
 	} else if mediaType != "" && url != "" && len(mediaKey) > 0 && stored && shouldDownload {
-		// Media that is not included in a webhook payload: async download for caching.
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		scheduleMediaDownload(func() {
 			success, _, _, downloadPath, err := downloadMediaForMessage(client, messageStore, msg.Info.ID, chatJID)
@@ -2133,23 +2155,30 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		})
 	}
 
-	// Send webhook for incoming messages.
-	// Forward self-messages when FORWARD_SELF=true.
-	// Always forward image messages (even without a text caption) so the AI vision
-	// pipeline can analyse the image content.
-	hasText := content != ""
-	hasImage := mediaType == "image"
-
-	if shouldForward && (hasText || hasImage) {
-		if hasImage {
-			SendWebhookWithMedia(
-				sender, content, chatJID, msg.Info.IsFromMe,
-				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
-				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
-			)
-		} else {
-			SendWebhookWithMessageID(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs, msg.Info.ID)
+	// Send webhook for incoming messages (self-messages when FORWARD_SELF=true).
+	// Every media message is forwarded, even without a caption, so receivers
+	// can store, display or analyse images, voice notes, documents and video.
+	if shouldForward {
+		payload := WebhookPayload{
+			Sender:          sender,
+			Content:         content,
+			ChatJID:         chatJID,
+			IsFromMe:        msg.Info.IsFromMe,
+			QuotedMessageId: quotedMessageId,
+			QuotedSender:    quotedSender,
+			QuotedContent:   quotedContent,
+			QuotedIsFromMe:  quotedIsFromMe,
+			MentionedJIDs:   mentionedJIDs,
+			MessageID:       msg.Info.ID,
+			Timestamp:       msgTimestamp.Unix(),
+			PushName:        strings.TrimSpace(msg.Info.PushName),
 		}
+		if mediaType != "" {
+			payload.MediaType = mediaType
+			payload.MimeType = mediaMimeType
+			payload.MediaFilename = filename
+		}
+		sendMessageWebhook(payload, mediaDownloadPath)
 	}
 
 	if err == nil {
@@ -2478,7 +2507,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		success, message, sentID := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2492,6 +2521,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+			ID:      sentID,
 		})
 	}))
 

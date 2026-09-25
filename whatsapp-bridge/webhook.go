@@ -67,6 +67,13 @@ type WebhookPayload struct {
 	MimeType      string `json:"mimeType,omitempty"`
 	MediaFilename string `json:"mediaFilename,omitempty"`
 	MediaBase64   string `json:"mediaBase64,omitempty"`
+	// MediaPath is the bridge-local path of the downloaded file, for
+	// receivers on the same host. Set for every media type, not only images.
+	MediaPath string `json:"mediaPath,omitempty"`
+	// Timestamp is the message send time (Unix seconds) and PushName the
+	// sender's self-chosen display name, when WhatsApp provides one.
+	Timestamp int64  `json:"timestamp,omitempty"`
+	PushName  string `json:"pushName,omitempty"`
 	// Reaction fields - populated when EventType is "reaction".
 	ReactionToMessageID string  `json:"reactionToMessageId,omitempty"`
 	ReactionEmoji       *string `json:"reactionEmoji,omitempty"`
@@ -169,25 +176,7 @@ func SendWebhookWithMedia(
 	quotedIsFromMe *bool, mentionedJIDs []string,
 	messageID, mediaType, mimeType, mediaFilename, localPath string,
 ) {
-	if !webhooksEnabled() {
-		return
-	}
-
-	var mediaBase64 string
-	if localPath != "" {
-		info, statErr := os.Stat(localPath)
-		if statErr != nil {
-			fmt.Printf("⚠ Could not stat media file for base64 encoding: %v\n", statErr)
-		} else if info.Size() > maxMediaBase64Bytes {
-			fmt.Printf("⚠ Media file too large for base64 encoding (%d bytes), skipping MediaBase64\n", info.Size())
-		} else if data, err := os.ReadFile(localPath); err == nil {
-			mediaBase64 = base64.StdEncoding.EncodeToString(data)
-		} else {
-			fmt.Printf("⚠ Could not read media file for base64 encoding: %v\n", err)
-		}
-	}
-
-	sendWebhookPayload(WebhookPayload{
+	sendMessageWebhook(WebhookPayload{
 		Sender:          sender,
 		Content:         content,
 		ChatJID:         chatJID,
@@ -201,8 +190,38 @@ func SendWebhookWithMedia(
 		MediaType:       mediaType,
 		MimeType:        mimeType,
 		MediaFilename:   mediaFilename,
-		MediaBase64:     mediaBase64,
-	})
+	}, localPath)
+}
+
+// sendMessageWebhook delivers a content message. When localPath names a
+// downloaded media file, its path is always included; images are also inlined
+// as base64 (up to maxMediaBase64Bytes) for receivers on another host.
+func sendMessageWebhook(payload WebhookPayload, localPath string) {
+	if !webhooksEnabled() {
+		return
+	}
+
+	if localPath != "" {
+		info, statErr := os.Stat(localPath)
+		switch {
+		case statErr != nil:
+			fmt.Printf("⚠ Could not stat media file: %v\n", statErr)
+		case payload.MediaType != "image":
+			payload.MediaPath = localPath
+		case info.Size() > maxMediaBase64Bytes:
+			payload.MediaPath = localPath
+			fmt.Printf("⚠ Media file too large for base64 encoding (%d bytes), skipping MediaBase64\n", info.Size())
+		default:
+			payload.MediaPath = localPath
+			if data, err := os.ReadFile(localPath); err == nil {
+				payload.MediaBase64 = base64.StdEncoding.EncodeToString(data)
+			} else {
+				fmt.Printf("⚠ Could not read media file for base64 encoding: %v\n", err)
+			}
+		}
+	}
+
+	sendWebhookPayload(payload)
 }
 
 // SendReactionWebhook sends a typed reaction event to the webhook endpoint.
