@@ -1670,10 +1670,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			ctx.QuotedMessage = &waProto.Message{Conversation: proto.String(quotedContent)}
 		}
 		ctx.MentionedJID = mentionedJIDs
-		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
-			Text:        proto.String(message),
-			ContextInfo: ctx,
+		ext := buildLinkPreview(message)
+		if ext == nil {
+			ext = &waProto.ExtendedTextMessage{Text: proto.String(message)}
 		}
+		ext.ContextInfo = ctx
+		msg.ExtendedTextMessage = ext
+	} else if ext := buildLinkPreview(message); ext != nil {
+		// WhatsApp draws link cards from data the sender attaches.
+		msg.ExtendedTextMessage = ext
 	} else {
 		msg.Conversation = proto.String(message)
 	}
