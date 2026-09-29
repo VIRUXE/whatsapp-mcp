@@ -2503,6 +2503,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 	// Business-account lookup by phone (see business_profile.go)
 	registerBusinessProfileEndpoint(mux, auth, client)
+	registerProfilePictureEndpoint(mux, auth, client)
 
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
