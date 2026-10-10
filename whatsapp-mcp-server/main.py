@@ -16,7 +16,13 @@ from whatsapp import (
     msg_to_dict,
 )
 from whatsapp import (
+    delete_message as whatsapp_delete_message,
+)
+from whatsapp import (
     download_media as whatsapp_download_media,
+)
+from whatsapp import (
+    edit_message as whatsapp_edit_message,
 )
 from whatsapp import (
     get_chat as whatsapp_get_chat,
@@ -392,6 +398,47 @@ def send_reaction(
         A dictionary containing success status and a status message
     """
     success, status_message = whatsapp_send_reaction(recipient, message_id, emoji, from_me, sender_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def edit_message(recipient: str, message_id: str, message: str) -> dict[str, Any]:
+    """Edit the text of a message you sent.
+
+    WhatsApp only honours edits within about 15 minutes of the original send;
+    later edits may be accepted by the bridge but ignored by recipients.
+
+    Args:
+        recipient: The chat JID the message belongs to (e.g., "12025551234@s.whatsapp.net"
+                   or a group JID like "123456789@g.us")
+        message_id: The ID of your message to edit
+        message: The replacement text
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_edit_message(recipient, message_id, message)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def delete_message(recipient: str, message_id: str, sender_jid: str = "") -> dict[str, Any]:
+    """Delete a message for everyone (revoke).
+
+    Works on your own messages (WhatsApp allows this for about 2 days after
+    sending), or on other people's messages in groups where you are admin.
+
+    Args:
+        recipient: The chat JID the message belongs to (e.g., "12025551234@s.whatsapp.net"
+                   or a group JID like "123456789@g.us")
+        message_id: The ID of the message to delete
+        sender_jid: Leave empty for your own messages. Set to the original sender's JID
+                    only to delete someone else's message as a group admin.
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_delete_message(recipient, message_id, sender_jid)
     return {"success": success, "message": status_message}
 
 

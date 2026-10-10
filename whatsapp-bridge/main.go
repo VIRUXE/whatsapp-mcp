@@ -310,6 +310,9 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
 		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
+	if err := ensureColumn(db, "messages", "edited_at", "TIMESTAMP"); err != nil {
+		return fmt.Errorf("failed to ensure messages.edited_at column: %w", err)
+	}
 	return nil
 }
 
@@ -930,6 +933,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
 			content = CASE
+				WHEN messages.edited_at IS NOT NULL THEN messages.content
 				WHEN excluded.media_type = 'audio' AND excluded.content = ''
 					AND messages.media_type = 'audio' AND messages.content LIKE '[transcript (%'
 				THEN messages.content
@@ -963,6 +967,19 @@ func (store *MessageStore) MarkMessageDeleted(messageID, chatJID string, deleted
 		`UPDATE messages SET deleted_at = ?
 		 WHERE id = ? AND chat_jid = ? AND deleted_at IS NULL`,
 		deletedAt, messageID, chatJID,
+	)
+	return err
+}
+
+// MarkMessageEdited replaces a message's content with its edited text and
+// stamps edited_at. Edits arriving out of order are ignored (an older edit
+// never overwrites a newer one). Editing a message the bridge never stored
+// is a silent no-op.
+func (store *MessageStore) MarkMessageEdited(messageID, chatJID, content string, editedAt time.Time) error {
+	_, err := store.db.Exec(
+		`UPDATE messages SET content = ?, edited_at = ?
+		 WHERE id = ? AND chat_jid = ? AND (edited_at IS NULL OR edited_at <= ?)`,
+		content, editedAt, messageID, chatJID, editedAt,
 	)
 	return err
 }
@@ -1258,6 +1275,30 @@ type ReactRequest struct {
 	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
 }
 
+// EditRequest is the request body for the /api/edit endpoint.
+type EditRequest struct {
+	Recipient string `json:"recipient"`  // chat JID or phone number
+	MessageID string `json:"message_id"` // ID of our own message to edit
+	Message   string `json:"message"`    // replacement text
+}
+
+// DeleteRequest is the request body for the /api/delete endpoint.
+type DeleteRequest struct {
+	Recipient string `json:"recipient"`  // chat JID or phone number
+	MessageID string `json:"message_id"` // ID of the message to delete for everyone
+	SenderJID string `json:"sender_jid"` // set only to delete someone else's message as group admin
+}
+
+// storeChatJID is the chat_jid form StoreMessage uses for a recipient: the
+// phone JID for DMs (never the LID we may address on the wire), or the JID
+// as given for groups.
+func storeChatJID(recipient string) string {
+	if !strings.Contains(recipient, "@") {
+		return recipient + "@" + types.DefaultUserServer
+	}
+	return recipient
+}
+
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
 // type, persist-side category). Single source of truth for the upload path
 // (which needs the whatsmeow.MediaType + MIME) and the SQLite persist path
@@ -1433,6 +1474,24 @@ func handleMessageRevoke(messageStore *MessageStore, msg *waProto.Message, chatJ
 	deletedAt := time.Unix(eventTimestamp, 0)
 	if err := messageStore.MarkMessageDeleted(targetID, chatJID, deletedAt); err != nil {
 		logger.Warnf("Failed to mark message %s in %s as deleted: %v", targetID, chatJID, err)
+	}
+}
+
+// handleMessageEdit applies an incoming MESSAGE_EDIT to the stored row.
+// whatsmeow unwraps EditedMessage before handing us the event, so msg is the
+// ProtocolMessage carrying the target key and the replacement content.
+func handleMessageEdit(messageStore *MessageStore, msg *waProto.Message, chatJID string, eventTimestamp int64, logger waLog.Logger) {
+	protoMsg := msg.GetProtocolMessage()
+	if protoMsg == nil || protoMsg.GetType() != waProto.ProtocolMessage_MESSAGE_EDIT {
+		return
+	}
+	targetID := protoMsg.GetKey().GetID()
+	content := extractTextContent(protoMsg.GetEditedMessage())
+	if targetID == "" || content == "" {
+		return
+	}
+	if err := messageStore.MarkMessageEdited(targetID, chatJID, content, time.Unix(eventTimestamp, 0)); err != nil {
+		logger.Warnf("Failed to apply edit to message %s in %s: %v", targetID, chatJID, err)
 	}
 }
 
@@ -2072,6 +2131,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	updateChatEphemeralSettingsFromProtocolMessage(messageStore, chatJID, msg.Message, msg.Info.Timestamp.Unix(), logger)
 	handleMessageRevoke(messageStore, msg.Message, chatJID, msg.Info.Timestamp.Unix(), logger)
+	handleMessageEdit(messageStore, msg.Message, chatJID, msg.Info.Timestamp.Unix(), logger)
 
 	// Backfill ephemeral state from any regular message's ContextInfo.
 	// EPHEMERAL_SETTING ProtocolMessages and GroupInfo events only fire on
@@ -2746,6 +2806,83 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+
+	// Handler for editing one of our own messages
+	mux.HandleFunc("/api/edit", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req EditRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" || strings.TrimSpace(req.Message) == "" {
+			http.Error(w, "recipient, message_id, and message are required", http.StatusBadRequest)
+			return
+		}
+		dbChat := storeChatJID(req.Recipient)
+		if fromMe, err := messageStore.GetMessageIsFromMe(req.MessageID, dbChat); err == nil && fromMe != nil && !*fromMe {
+			http.Error(w, "only your own messages can be edited", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := resolveRecipientJID(client, req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid recipient: %v", err), http.StatusBadRequest)
+			return
+		}
+		msg := client.BuildEdit(chatJID, req.MessageID, &waProto.Message{Conversation: proto.String(req.Message)})
+		w.Header().Set("Content-Type", "application/json")
+		resp, err := client.SendMessage(context.Background(), chatJID, msg)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if err := messageStore.MarkMessageEdited(req.MessageID, dbChat, req.Message, resp.Timestamp); err != nil {
+			fmt.Printf("Warning: edit sent but local store update failed for %s: %v\n", req.MessageID, err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+	}))
+
+	// Handler for deleting a message for everyone (revoke)
+	mux.HandleFunc("/api/delete", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req DeleteRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" {
+			http.Error(w, "recipient and message_id are required", http.StatusBadRequest)
+			return
+		}
+		dbChat := storeChatJID(req.Recipient)
+		var senderJID types.JID
+		if req.SenderJID != "" {
+			var err error
+			if senderJID, err = types.ParseJID(req.SenderJID); err != nil || senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		} else if fromMe, err := messageStore.GetMessageIsFromMe(req.MessageID, dbChat); err == nil && fromMe != nil && !*fromMe {
+			http.Error(w, "message was not sent by you; pass sender_jid to delete it as group admin", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := resolveRecipientJID(client, req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid recipient: %v", err), http.StatusBadRequest)
+			return
+		}
+		msg := client.BuildRevoke(chatJID, senderJID, req.MessageID)
+		w.Header().Set("Content-Type", "application/json")
+		resp, err := client.SendMessage(context.Background(), chatJID, msg)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		if err := messageStore.MarkMessageDeleted(req.MessageID, dbChat, resp.Timestamp); err != nil {
+			fmt.Printf("Warning: delete sent but local store update failed for %s: %v\n", req.MessageID, err)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	}))
