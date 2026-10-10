@@ -109,6 +109,7 @@ func newTestMessageStore(t *testing.T) *MessageStore {
 			file_length INTEGER,
 			deleted_at TIMESTAMP,
 			quoted_message_id TEXT,
+			edited_at TIMESTAMP,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -3319,5 +3320,85 @@ func TestResolvePairPhone(t *testing.T) {
 	t.Setenv("WHATSAPP_PAIR_PHONE", "")
 	if got := resolvePairPhone(); got != "" {
 		t.Errorf("resolvePairPhone() = %q, want empty", got)
+	}
+}
+
+func editEvent(targetID, newText string, ts time.Time) *events.Message {
+	editType := waProto.ProtocolMessage_MESSAGE_EDIT
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     phonePN,
+				Sender:   phonePN,
+				IsFromMe: false,
+			},
+			ID:        "edit-" + targetID,
+			Timestamp: ts,
+		},
+		Message: &waProto.Message{
+			ProtocolMessage: &waProto.ProtocolMessage{
+				Type: &editType,
+				Key: &waCommon.MessageKey{
+					RemoteJID: proto.String(phonePN.String()),
+					ID:        proto.String(targetID),
+					FromMe:    proto.Bool(false),
+				},
+				EditedMessage: &waProto.Message{Conversation: proto.String(newText)},
+			},
+		},
+	}
+}
+
+func readContent(t *testing.T, ms *MessageStore, chatJID, messageID string) string {
+	t.Helper()
+	var content string
+	if err := ms.db.QueryRow("SELECT content FROM messages WHERE id = ? AND chat_jid = ?",
+		messageID, chatJID).Scan(&content); err != nil {
+		t.Fatalf("read content: %v", err)
+	}
+	return content
+}
+
+func TestHandleMessage_EditReplacesContent(t *testing.T) {
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	chatJID := phonePN.String()
+	targetID := "3AEDIT"
+	if err := ms.StoreMessage(targetID, chatJID, phonePN.User, "typo", time.Unix(1710000000, 0), false,
+		"", "", "", nil, nil, nil, 0, ""); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	handleMessage(client, ms, editEvent(targetID, "fixed", time.Unix(1710000020, 0)), testLogger())
+	// A stale edit delivered late must not win.
+	handleMessage(client, ms, editEvent(targetID, "older", time.Unix(1710000010, 0)), testLogger())
+	if got := readContent(t, ms, chatJID, targetID); got != "fixed" {
+		t.Fatalf("expected edited content %q, got %q", "fixed", got)
+	}
+
+	// A history-sync replay of the original must not undo the edit.
+	if err := ms.StoreMessage(targetID, chatJID, phonePN.User, "typo", time.Unix(1710000000, 0), false,
+		"", "", "", nil, nil, nil, 0, ""); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if got := readContent(t, ms, chatJID, targetID); got != "fixed" {
+		t.Fatalf("replayed original clobbered edit: got %q", got)
+	}
+
+	var rowCount int
+	if err := ms.db.QueryRow("SELECT COUNT(*) FROM messages").Scan(&rowCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("edit carrier must not be stored as its own row, got %d rows", rowCount)
+	}
+}
+
+func TestStoreChatJID(t *testing.T) {
+	if got := storeChatJID("351910000000"); got != "351910000000@s.whatsapp.net" {
+		t.Fatalf("bare phone: got %q", got)
+	}
+	if got := storeChatJID("123@g.us"); got != "123@g.us" {
+		t.Fatalf("group: got %q", got)
 	}
 }

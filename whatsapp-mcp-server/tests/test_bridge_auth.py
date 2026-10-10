@@ -83,6 +83,8 @@ def test_send_message_without_token_surfaces_bridge_401(monkeypatch, tmp_path):
         ("download_media", ("msg-id", "12025551234@s.whatsapp.net"), "/download"),
         ("send_reaction", ("12025551234@s.whatsapp.net", "3AABCDEF01234567", "👍"), "/react"),
         ("mark_messages_read", (["3AABCDEF01234567"], "12025551234@s.whatsapp.net"), "/mark-read"),
+        ("edit_message", ("12025551234@s.whatsapp.net", "3AABCDEF01234567", "fixed"), "/edit"),
+        ("delete_message", ("12025551234@s.whatsapp.net", "3AABCDEF01234567"), "/delete"),
     ],
 )
 def test_bridge_post_helpers_include_auth_headers(monkeypatch, tmp_path, func_name, args, expected_suffix):
@@ -300,3 +302,27 @@ def test_send_message_without_mentions_omits_mentions_field(monkeypatch):
 
     payload = calls[0]["json"]
     assert "mentions" not in payload
+
+
+def test_edit_and_delete_post_correct_payloads(monkeypatch):
+    calls = []
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None):
+        calls.append({"url": url, "json": json})
+        return DummyResponse(payload={"ok": True})
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    assert whatsapp.edit_message("123@g.us", "3AEDIT", "new text") == (True, "Message edited")
+    assert whatsapp.delete_message("123@g.us", "3ADEL", sender_jid="999@s.whatsapp.net") == (True, "Message deleted")
+    assert calls[0]["url"].endswith("/edit")
+    assert calls[0]["json"] == {"recipient": "123@g.us", "message_id": "3AEDIT", "message": "new text"}
+    assert calls[1]["url"].endswith("/delete")
+    assert calls[1]["json"] == {"recipient": "123@g.us", "message_id": "3ADEL", "sender_jid": "999@s.whatsapp.net"}
+
+
+def test_edit_rejects_blank_text_without_calling_bridge(monkeypatch):
+    monkeypatch.setattr(whatsapp.requests, "post", lambda *a, **k: pytest.fail("bridge called"))
+    success, _ = whatsapp.edit_message("123@g.us", "3AEDIT", "   ")
+    assert success is False

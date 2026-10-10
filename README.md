@@ -219,6 +219,28 @@ automatically.
 - "Mark those messages as read"
 - "Mark the last three messages from Alice in the team group as read"
 
+#### `edit_message`
+
+Edit the text of a message you sent. WhatsApp only honours edits within about 15 minutes of sending.
+
+**Parameters:**
+
+- `recipient` (required): Chat JID the message belongs to (phone JID or group JID)
+- `message_id` (required): ID of your message to edit
+- `message` (required): Replacement text
+
+#### `delete_message`
+
+Delete a message for everyone (revoke). Works on your own messages, or on others' messages in groups where you are admin.
+
+**Parameters:**
+
+- `recipient` (required): Chat JID the message belongs to (phone JID or group JID)
+- `message_id` (required): ID of the message to delete
+- `sender_jid` (optional): Leave empty for your own messages; set to the original sender's JID to delete it as a group admin
+
+Edits and deletions — whether sent through these tools or received from others — are applied to `messages.db`: edits replace `content` and stamp `edited_at`; deletions stamp `deleted_at` and keep the original content.
+
 #### `send_reaction`
 
 Send (or remove) an emoji reaction to a message.
@@ -894,6 +916,8 @@ flowchart LR
         READ["/api/mark-read"]
         DOWN["/api/download"]
         REACT["/api/react"]
+        EDIT["/api/edit"]
+        DEL["/api/delete"]
         TYPE["/api/typing"]
         HIST["/api/history"]
         HEALTH["/api/health"]

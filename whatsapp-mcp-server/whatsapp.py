@@ -1304,3 +1304,47 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def _post_message_action(endpoint: str, payload: dict[str, Any], ok_message: str) -> tuple[bool, str]:
+    """POST a message-level action (edit/delete) to the bridge."""
+    if not payload.get("recipient"):
+        return False, "Recipient must be provided"
+    if not payload.get("message_id"):
+        return False, "Message ID must be provided"
+    try:
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/{endpoint}", json=payload, headers=_bridge_headers())
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                return True, ok_message
+            return False, result.get("error", "Unknown error")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+
+
+def edit_message(recipient: str, message_id: str, message: str) -> tuple[bool, str]:
+    """Edit the text of one of your own previously sent messages.
+
+    WhatsApp only accepts edits within ~15 minutes of sending; older edits are
+    silently dropped by recipients' clients.
+    """
+    if not message.strip():
+        return False, "New message text must be provided"
+    return _post_message_action(
+        "edit", {"recipient": recipient, "message_id": message_id, "message": message}, "Message edited"
+    )
+
+
+def delete_message(recipient: str, message_id: str, sender_jid: str = "") -> tuple[bool, str]:
+    """Delete a message for everyone (revoke).
+
+    Leave sender_jid empty for your own messages. Pass the original sender's
+    JID only to delete someone else's message in a group where you are admin.
+    """
+    return _post_message_action(
+        "delete", {"recipient": recipient, "message_id": message_id, "sender_jid": sender_jid}, "Message deleted"
+    )
